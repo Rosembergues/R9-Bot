@@ -881,9 +881,11 @@ app.post("/api/whatsapp/generate-variations", async (req, res) => {
 
   try {
     const ai = getGeminiClient();
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Gere exatamente ${numVariations} variações diferentes da mensagem a seguir, para serem enviadas pelo WhatsApp.
+    const candidateModels = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"];
+    let lastError: any = null;
+    let responseText: string | undefined = undefined;
+
+    const prompt = `Gere exatamente ${numVariations} variações diferentes da mensagem a seguir, para serem enviadas pelo WhatsApp.
 
 Mensagem original:
 "${message}"
@@ -892,25 +894,68 @@ REQUISITOS IMPORTANTES:
 1. Mantenha todas as variáveis dinâmicas (como {nome}, {var1}, {var2}, {var3}, etc.) intactas e nos locais correspondentes das frases para que a substituição de dados continue funcionando normalmente.
 2. Altere as saudações (ex: "Olá", "Oi", "Tudo bem?", "Como vai?", "E aí"), a ordem das palavras, use sinônimos e mude a formatação e pontuação levemente para que as mensagens fiquem o mais diferentes possível entre si (para evitar detecção de spam e banimento no WhatsApp).
 3. Preserve exatamente o mesmo significado principal e tom da mensagem original (seja profissional, amigável, cobrança, suporte, etc.).
-4. Não inclua numeração, nem explicações nas respostas. Retorne apenas as mensagens finais no formato solicitado.`,
-      config: {
-        systemInstruction: "Você é um especialista em redação e marketing conversacional, especializado em evitar filtros de spam do WhatsApp diversificando as mensagens sem perder o tom e os marcadores dinâmicos. Você SEMPRE retorna a resposta exatamente como uma lista/array JSON de strings.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.STRING
-          }
-        }
-      }
-    });
+4. Não inclua numeração, nem explicações nas respostas. Retorne apenas as mensagens finais no formato solicitado.`;
 
-    const text = response.text;
-    if (!text) {
-      throw new Error("Resposta da IA vazia.");
+    const systemInstruction = "Você é um especialista em redação e marketing conversacional, especializado em evitar filtros de spam do WhatsApp diversificando as mensagens sem perder o tom e os marcadores dinâmicos. Você SEMPRE retorna a resposta exatamente como uma lista/array JSON de strings.";
+
+    for (const model of candidateModels) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.STRING
+              }
+            }
+          }
+        });
+
+        if (response.text && response.text.trim()) {
+          responseText = response.text;
+          break;
+        }
+      } catch (modelErr: any) {
+        console.warn(`[Gemini] Falha ao tentar modelo ${model}:`, modelErr?.message || modelErr);
+        lastError = modelErr;
+      }
     }
 
-    const variations = JSON.parse(text.trim());
+    if (!responseText) {
+      throw lastError || new Error("Nenhum modelo Gemini disponível respondeu com sucesso.");
+    }
+
+    let variations: string[] = [];
+    try {
+      let clean = responseText.trim();
+      if (clean.startsWith("```")) {
+        clean = clean.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+      }
+      variations = JSON.parse(clean);
+    } catch (parseErr) {
+      console.warn("[Gemini] Erro no JSON.parse direto, tentando regex:", parseErr);
+      const matches = responseText.match(/"([^"\\]*(?:\\.[^"\\]*)*)"/g);
+      if (matches && matches.length > 0) {
+        variations = matches.map(m => {
+          try {
+            return JSON.parse(m);
+          } catch {
+            return m.replace(/^"|"$/g, "");
+          }
+        });
+      } else {
+        throw new Error("Não foi possível decodificar as variações retornadas pela IA.");
+      }
+    }
+
+    if (!Array.isArray(variations) || variations.length === 0) {
+      throw new Error("A IA não retornou uma lista válida de variações.");
+    }
+
     res.json({ variations });
   } catch (err: any) {
     console.error('Erro ao gerar variações com Gemini:', err);
